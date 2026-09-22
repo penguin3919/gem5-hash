@@ -1,0 +1,8 @@
+m5out_bench_no_archpt/stats.txt:simTicks                                 141120341000                       # Number of ticks simulated (Tick)
+m5out_bench_no_archpt/stats.txt:simInsts                                     12138778                       # Number of instructions simulated (Count)
+m5out_bench/stats.txt:simTicks                                 163151115000                       # Number of ticks simulated (Tick)
+m5out_bench/stats.txt:simInsts                                     12138776                       # Number of instructions simulated (Count)
+m5out_bench_no_archpt/stats.txt:board.processor.cores.core.mmu.dtb.misses            0                       # Total TLB (read and write) misses (Count)
+m5out_bench_no_archpt/stats.txt:board.processor.cores.core.mmu.dtb.missRate          nan                       # TLB missrate (read and write) (Count)
+m5out_bench/stats.txt:board.processor.cores.core.mmu.dtb.misses      2016437                       # Total TLB (read and write) misses (Count)
+m5out_bench/stats.txt:board.processor.cores.core.mmu.dtb.missRate     0.988466                       # TLB missrate (read and write) (Count)
