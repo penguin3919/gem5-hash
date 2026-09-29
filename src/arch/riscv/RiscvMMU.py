@@ -41,6 +41,8 @@ from m5.objects.BaseMMU import BaseMMU
 from m5.objects.RiscvTLB import RiscvTLB
 from m5.objects.PMAChecker import PMAChecker
 from m5.objects.PMP import PMP
+from m5.params import NullSimObject, VectorPortRef
+from m5.util import fatal
 
 
 class RiscvMMU(BaseMMU):
@@ -60,3 +62,17 @@ class RiscvMMU(BaseMMU):
     def connectWalkerPorts(self, iport, dport):
         self.itb.walker.port = iport
         self.dtb.walker.port = dport
+        # Optional hash page table walkers share the walker ports. That only
+        # works when the hierarchy hands us a vector port (e.g. the L2 bus's
+        # cpu_side_ports in the NoPTWC hierarchies). Hierarchies with PTW
+        # caches pass a single cpu_side port, which cannot take a second peer.
+        for tlb, port in ((self.itb, iport), (self.dtb, dport)):
+            if isinstance(tlb.hash_walker, NullSimObject):
+                continue
+            if not isinstance(port, VectorPortRef):
+                fatal(
+                    "hash_walker needs a vector walker port (use a NoPTWC "
+                    "cache hierarchy, e.g. "
+                    "PrivateL1PrivateL2CacheNoPTWCHierarchy); got %s" % port
+                )
+            tlb.hash_walker.port = port

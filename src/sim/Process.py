@@ -48,6 +48,16 @@ class Process(SimObject):
         "maintain an in-memory version of the page\
                             table in an architecture-specific format",
     )
+    useHashPT = Param.Bool(
+        False,
+        "maintain a hash page table in simulated physical memory, walked by RiscvHashWalker",
+    )
+    hashPTBuckets = Param.Unsigned(
+        1024, "hash page table: main buckets (32 slots each)"
+    )
+    hashPTOvBuckets = Param.Unsigned(
+        1024, "hash page table: overflow buckets (4 slots each, even)"
+    )
     kvmInSE = Param.Bool("false", "initialize the process for KvmCPU in SE")
     maxStackSize = Param.MemorySize("64MiB", "maximum size of the stack")
 

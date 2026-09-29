@@ -50,6 +50,25 @@ class RiscvPagetableWalker(ClockedObject):
     pmp = Param.PMP(Parent.any, "PMP")
 
 
+class RiscvHashWalker(ClockedObject):
+    type = "RiscvHashWalker"
+    cxx_class = "gem5::RiscvISA::HashWalker"
+    cxx_header = "arch/riscv/hash_walker.hh"
+
+    port = RequestPort("Port for hash page table walker")
+    system = Param.System(Parent.any, "system object")
+    num_squash_per_cycle = Param.Unsigned(
+        4, "Number of outstanding walks that can be squashed per cycle"
+    )
+    hash_latency = Param.Cycles(
+        0,
+        "Additional latency (cycles) added before the first memory packet "
+        "to model hash address computation. 0 = no extra latency (default)."
+    )
+    pma_checker = Param.PMAChecker(Parent.any, "PMA Checker")
+    pmp = Param.PMP(Parent.any, "PMP")
+
+
 class RiscvTLB(BaseTLB):
     type = "RiscvTLB"
     cxx_class = "gem5::RiscvISA::TLB"
@@ -59,6 +78,7 @@ class RiscvTLB(BaseTLB):
     walker = Param.RiscvPagetableWalker(
         RiscvPagetableWalker(), "page table walker"
     )
+    hash_walker = Param.RiscvHashWalker(NULL, "hash page table walker")
     # Grab the pma_checker from the MMU
     pma_checker = Param.PMAChecker(Parent.any, "PMA Checker")
     pmp = Param.PMP(Parent.any, "Physical Memory Protection Unit")

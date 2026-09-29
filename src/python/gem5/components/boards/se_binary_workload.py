@@ -72,6 +72,9 @@ class SEBinaryWorkload:
         arguments: List[str] = [],
         checkpoint: Optional[Union[Path, CheckpointResource]] = None,
         use_arch_pt: bool = False,
+        use_hash_pt: bool = False,
+        hash_pt_buckets: int = 1024,
+        hash_pt_ov_buckets: int = 1024,
     ) -> None:
         """Set up the system to run a specific binary.
 
@@ -91,7 +94,18 @@ class SEBinaryWorkload:
         :param checkpoint: The checkpoint directory. Used to restore the
         simulation to that checkpoint.
         :param use_arch_pt: Enable the use of page walker in SE mode.
+        :param use_hash_pt: Enable the use of hash page table walker in SE
+        mode. Mutually exclusive with use_arch_pt.
+        :param hash_pt_buckets: Number of main buckets of the hash page table
+        (32 slots each). Only used with use_hash_pt.
+        :param hash_pt_ov_buckets: Number of overflow buckets (4 slots each,
+        must be even). Only used with use_hash_pt.
         """
+
+        if use_arch_pt and use_hash_pt:
+            raise ValueError(
+                "use_arch_pt and use_hash_pt are mutually exclusive"
+            )
 
         # We assume this this is in a multiple-inheritance setup with an
         # Abstract board. This function will not work otherwise.
@@ -116,6 +130,9 @@ class SEBinaryWorkload:
         if env_list is not None:
             process.env = env_list
         process.useArchPT = use_arch_pt
+        process.useHashPT = use_hash_pt
+        process.hashPTBuckets = hash_pt_buckets
+        process.hashPTOvBuckets = hash_pt_ov_buckets
 
         if isinstance(self.get_processor(), SwitchableProcessor):
             # This is a hack to get switchable processors working correctly in

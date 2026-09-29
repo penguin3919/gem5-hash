@@ -38,6 +38,8 @@
 #include "arch/riscv/mmu.hh"
 #include "arch/riscv/pagetable.hh"
 #include "arch/riscv/pagetable_walker.hh"
+#include "arch/riscv/hash_walker.hh"
+#include "arch/riscv/hash_arch_page_table.hh"
 #include "arch/riscv/pma_checker.hh"
 #include "arch/riscv/pmp.hh"
 #include "arch/riscv/pra_constants.hh"
@@ -82,12 +84,22 @@ TLB::TLB(const Params &p) :
 
     walker = p.walker;
     walker->setTLB(this);
+
+    hashWalker = p.hash_walker;
+    if (hashWalker)
+        hashWalker->setTLB(this);
 }
 
 Walker *
 TLB::getWalker()
 {
     return walker;
+}
+
+HashWalker *
+TLB::getHashWalker()
+{
+    return hashWalker;
 }
 
 void
@@ -288,9 +300,19 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
     Addr vaddr = Addr(sext<VADDR_BITS>(req->getVaddr()));
     SATP satp = tc->readMiscReg(MISCREG_SATP);
 
+    // In SE mode with a hash page table, TLB misses are served by the
+    // hash walker instead of the Sv39 walker. Everything else (lookup,
+    // permission check on hits, paddr formation) is shared.
+    Process *proc = !FullSystem ? tc->getProcessPtr() : nullptr;
+    bool useHash  = proc && proc->useHashPT && hashWalker;
+    auto startWalk = [&]() {
+        return useHash ? hashWalker->start(tc, translation, req, mode)
+                       : walker->start(tc, translation, req, mode);
+    };
+
     TlbEntry *e = lookup(vaddr, satp.asid, mode, false);
     if (!e) {
-        Fault fault = walker->start(tc, translation, req, mode);
+        Fault fault = startWalk();
         if (translation != nullptr || fault != NoFault) {
             // This gets ignored in atomic mode.
             delayed = true;
@@ -308,7 +330,7 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
         // again to update the dirty flag.
         if (mode == BaseMMU::Write && !e->pte.w) {
             DPRINTF(TLB, "Dirty bit not set, repeating PT walk\n");
-            fault = walker->start(tc, translation, req, mode);
+            fault = startWalk();
             if (translation != nullptr || fault != NoFault) {
                 delayed = true;
                 return fault;
@@ -343,7 +365,39 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
 {
     delayed = false;
 
-    if (FullSystem || tc->getProcessPtr()->useArchPT) {
+    // Check if hash page table walk is requested
+    Process *proc = !FullSystem ? tc->getProcessPtr() : nullptr;
+
+    // Without a walker the request would silently fall through to the
+    // host-side EmulationPageTable lookup: the run completes, but no walk
+    // is ever simulated. Fail loudly instead.
+    fatal_if(proc && proc->useHashPT && !hashWalker,
+             "%s: Process.useHashPT is set but no hash_walker is attached "
+             "to this TLB", name());
+
+    bool useHash  = proc && proc->useHashPT && hashWalker;
+
+    if (useHash) {
+        // Same flow as the Sv39 path below, except that SATP stays BARE
+        // for the hash table, so the "physical address" shortcut must not
+        // be taken. doTranslate() checks the TLB first and only starts the
+        // hash walker on a miss.
+        assert(req->getSize() > 0);
+        if (req->getVaddr() + req->getSize() - 1 < req->getVaddr())
+            return std::make_shared<GenericPageTableFault>(req->getVaddr());
+
+        PrivilegeMode pmode = getMemPriv(tc, mode);
+        Fault fault = doTranslate(req, tc, translation, mode, delayed);
+
+        if (!delayed && fault == NoFault && bits(req->getPaddr(), 63))
+            fault = createPagefault(req->getVaddr(), mode);
+
+        if (!delayed && fault == NoFault) {
+            pma->check(req);
+            fault = pmp->pmpCheck(req, mode, pmode, tc);
+        }
+        return fault;
+    } else if (FullSystem || (proc && proc->useArchPT)) {
         PrivilegeMode pmode = getMemPriv(tc, mode);
         SATP satp = tc->readMiscReg(MISCREG_SATP);
         if (pmode == PrivilegeMode::PRV_M || satp.mode == AddrXlateMode::BARE)
@@ -378,6 +432,7 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
 
         return fault;
     } else {
+        // SE mode with EmulationPageTable (hash lookup, no walk)
         // In the O3 CPU model, sometimes a memory access will be speculatively
         // executed along a branch that will end up not being taken where the
         // address is invalid.  In that case, return a fault rather than trying
@@ -389,7 +444,7 @@ TLB::translate(const RequestPtr &req, ThreadContext *tc,
         if (req->getVaddr() + req->getSize() - 1 < req->getVaddr())
             return std::make_shared<GenericPageTableFault>(req->getVaddr());
 
-        Process * p = tc->getProcessPtr();
+        Process *p = tc->getProcessPtr();
 
         Fault fault = p->pTable->translate(req);
         if (fault != NoFault)
@@ -427,14 +482,30 @@ TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
     const Addr vaddr = req->getVaddr();
     Addr paddr = vaddr;
 
-    if (FullSystem || tc->getProcessPtr()->useArchPT) {
+    Process *proc = !FullSystem ? tc->getProcessPtr() : nullptr;
+    bool useHash  = proc && proc->useHashPT && hashWalker;
+
+    if (useHash) {
+        // Hash page table functional walk (physProxy direct, no Packets)
+        auto *hpt = dynamic_cast<HashArchPageTable *>(proc->pTable);
+        fatal_if(!hpt, "TLB::translateFunctional: not a HashArchPageTable");
+        const Addr vpn = vaddr & ~(hpt->pageSize() - 1);
+        HashPTE pte;
+        bool found = hpt->physLookup(vpn, pte);
+        // Grow the stack on demand, as the EmulationPageTable path does
+        if (!found && mode != BaseMMU::Execute && proc->fixupFault(vaddr))
+            found = hpt->physLookup(vpn, pte);
+        if (!found)
+            return std::make_shared<GenericPageTableFault>(vaddr);
+        paddr = pte.paddr | hpt->pageOffset(vaddr);
+    } else if (FullSystem || (proc && proc->useArchPT)) {
         MMU *mmu = static_cast<MMU *>(tc->getMMUPtr());
 
         PrivilegeMode pmode = mmu->getMemPriv(tc, mode);
         SATP satp = tc->readMiscReg(MISCREG_SATP);
         if ((pmode != PrivilegeMode::PRV_M &&
             satp.mode != AddrXlateMode::BARE) ||
-            tc->getProcessPtr()->useArchPT) {
+            (proc && proc->useArchPT)) {
             Walker *walker = mmu->getDataWalker();
             unsigned logBytes;
             Fault fault = walker->startFunctional(
@@ -445,8 +516,7 @@ TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
             Addr masked_addr = vaddr & mask(logBytes);
             paddr |= masked_addr;
         }
-    }
-    else {
+    } else {
         Process *process = tc->getProcessPtr();
         const auto *pte = process->pTable->lookup(vaddr);
 

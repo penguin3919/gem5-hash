@@ -176,6 +176,12 @@ class Process : public SimObject
 
     // flag for using architecture specific page table
     bool useArchPT;
+    // flag for using the hash page table walked by RiscvHashWalker
+    // (declared right after useArchPT to match the constructor init order)
+    bool useHashPT;
+    // hash page table size (kept so clone()/fork() children get the same)
+    unsigned hashPTBuckets;
+    unsigned hashPTOvBuckets;
     // running KVM requires special initialization
     bool kvmInSE;
     // flag for using the process as a thread which shares page tables

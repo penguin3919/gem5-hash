@@ -56,6 +56,7 @@
 #include "sim/system.hh"
 
 #include "arch/riscv/pagetable.hh"
+#include "arch/riscv/hash_arch_page_table.hh"
 #include "mem/multi_level_page_table.hh"
 
 namespace gem5
@@ -73,24 +74,36 @@ typedef MultiLevelPageTable<HierarchySv39<38, 30>,
 
 RiscvProcess::RiscvProcess(const ProcessParams &params,
         loader::ObjectFile *objFile) :
-        Process(params, params.useArchPT ?
-                static_cast<EmulationPageTable *>(
-                            new ArchPageTable(params.name, params.pid,
-                                              params.system, PageBytes)) :
-                new EmulationPageTable(params.name, params.pid, PageBytes),
+        Process(params,
+                params.useHashPT ?
+                    static_cast<EmulationPageTable *>(
+                        new HashArchPageTable(params.name, params.pid,
+                                             params.system, PageBytes,
+                                             params.hashPTBuckets,
+                                             params.hashPTOvBuckets)) :
+                params.useArchPT ?
+                    static_cast<EmulationPageTable *>(
+                        new ArchPageTable(params.name, params.pid,
+                                         params.system, PageBytes)) :
+                    new EmulationPageTable(params.name, params.pid, PageBytes),
                 objFile)
 {
+    // Both flags would build a HashArchPageTable (checked first above) and
+    // then treat it as the Sv39 ArchPageTable in RiscvProcess64::initState().
+    fatal_if(params.useArchPT && params.useHashPT,
+             "useArchPT and useHashPT are mutually exclusive");
 }
 
 RiscvProcess64::RiscvProcess64(const ProcessParams &params,
         loader::ObjectFile *objFile) :
         RiscvProcess(params, objFile)
 {
-    const Addr stack_base = useArchPT ? 0xFFFF'FFFF'FFFF'0000L : 0x7FFFFFFFFFFFFFFFL;
+    const bool useVirtAddrSpace = useArchPT || useHashPT;
+    const Addr stack_base = useVirtAddrSpace ? 0xFFFF'FFFF'FFFF'0000L : 0x7FFFFFFFFFFFFFFFL;
     const Addr max_stack_size = 8 * 1024 * 1024;
     const Addr next_thread_stack_base = stack_base - max_stack_size;
     const Addr brk_point = roundUp(image.maxAddr(), PageBytes);
-    const Addr mmap_end = useArchPT ? 0xFFFF'FFEF'FFFF'0000L : 0x4000000000000000L;
+    const Addr mmap_end = useVirtAddrSpace ? 0xFFFF'FFEF'FFFF'0000L : 0x4000000000000000L;
     memState = std::make_shared<MemState>(this, brk_point, stack_base,
             max_stack_size, next_thread_stack_base, mmap_end);
 }
@@ -112,7 +125,7 @@ RiscvProcess32::RiscvProcess32(const ProcessParams &params,
 void
 RiscvProcess64::initState()
 {
-    // Setup SATP register
+    // Setup SATP register (Sv39: mode + ASID + root; hash: ASID only)
     SATP satp = 0x0;
     if (useArchPT)
     {
@@ -122,9 +135,21 @@ RiscvProcess64::initState()
             system->threads[ctx]->setMiscReg(MISCREG_SATP, satp);
     }
 
+    // Hash page table: SATP stays BARE (no table root), but tag TLB entries
+    // with the process ID like the Sv39 path does, so entries from
+    // different processes never alias.
+    if (useHashPT)
+    {
+        satp.asid = this->pid();
+        for (ContextID ctx: contextIds)
+            system->threads[ctx]->setMiscReg(MISCREG_SATP, satp);
+    }
+
+    // Process::initState() calls pTable->initState(), which allocates the
+    // hash page table layout in physical memory (Sv39 does the same).
     Process::initState();
 
-    // Setup SATP.PPN field
+    // Setup SATP.PPN field (Sv39 only)
     // This is done after pTable initialization
     if (useArchPT)
     {
@@ -132,6 +157,8 @@ RiscvProcess64::initState()
         for (ContextID ctx: contextIds)
             system->threads[ctx]->setMiscReg(MISCREG_SATP, satp);
     }
+    // Hash page table: SATP.ppn is unused; the table base is kept in
+    // HashArchPageTable itself
 
     argsInit<uint64_t>(PageBytes);
     for (ContextID ctx: contextIds) {

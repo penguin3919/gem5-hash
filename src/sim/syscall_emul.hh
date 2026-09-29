@@ -1656,6 +1656,9 @@ doClone(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
     pp->pid = temp_pid;
     pp->ppid = (flags & OS::TGT_CLONE_THREAD) ? p->ppid() : p->pid();
     pp->useArchPT = p->useArchPT;
+    pp->useHashPT = p->useHashPT;
+    pp->hashPTBuckets = p->hashPTBuckets;
+    pp->hashPTOvBuckets = p->hashPTOvBuckets;
     pp->kvmInSE = p->kvmInSE;
     Process *cp = pp->create();
     // TODO: there is no way to know when the Process SimObject is done with

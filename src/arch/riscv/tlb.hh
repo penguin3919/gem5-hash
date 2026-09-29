@@ -55,6 +55,7 @@ class ThreadContext;
 namespace RiscvISA {
 
 class Walker;
+class HashWalker;
 
 class TLB : public BaseTLB
 {
@@ -67,7 +68,8 @@ class TLB : public BaseTLB
     EntryList freeList;         // free entries
     uint64_t lruSeq;
 
-    Walker *walker;
+    Walker     *walker;
+    HashWalker *hashWalker;
 
     struct TlbStats : public statistics::Group
     {
@@ -94,7 +96,8 @@ class TLB : public BaseTLB
     typedef RiscvTLBParams Params;
     TLB(const Params &p);
 
-    Walker *getWalker();
+    Walker     *getWalker();
+    HashWalker *getHashWalker();
 
     void takeOverFrom(BaseTLB *old) override {}
 
@@ -104,6 +107,7 @@ class TLB : public BaseTLB
 
     Fault checkPermissions(STATUS status, PrivilegeMode pmode, Addr vaddr,
                            BaseMMU::Mode mode, PTESv39 pte);
+
     Fault createPagefault(Addr vaddr, BaseMMU::Mode mode);
 
     PrivilegeMode getMemPriv(ThreadContext *tc, BaseMMU::Mode mode);
