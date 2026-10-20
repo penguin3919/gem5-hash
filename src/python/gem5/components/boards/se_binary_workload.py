@@ -73,8 +73,8 @@ class SEBinaryWorkload:
         checkpoint: Optional[Union[Path, CheckpointResource]] = None,
         use_arch_pt: bool = False,
         use_hash_pt: bool = False,
-        hash_pt_buckets: int = 1024,
-        hash_pt_ov_buckets: int = 1024,
+        hash_pt_buckets: int = 4096,
+        hash_pt_ov_buckets: int = 512,
     ) -> None:
         """Set up the system to run a specific binary.
 
@@ -97,9 +97,12 @@ class SEBinaryWorkload:
         :param use_hash_pt: Enable the use of hash page table walker in SE
         mode. Mutually exclusive with use_arch_pt.
         :param hash_pt_buckets: Number of main buckets of the hash page table
-        (32 slots each). Only used with use_hash_pt.
-        :param hash_pt_ov_buckets: Number of overflow buckets (4 slots each,
-        must be even). Only used with use_hash_pt.
+        (one 64 B line, 8 slots each). Only used with use_hash_pt. For
+        1 GiB, (main + overflow) x 8 = 262,144 slots; the split sets how
+        full the table can get before a fatal: 32256+512 ~60%,
+        28672+4096 ~83%, 24576+8192 ~90%.
+        :param hash_pt_ov_buckets: Number of overflow buckets (one 64 B line,
+        8 slots each, must be even). Only used with use_hash_pt.
         """
 
         if use_arch_pt and use_hash_pt:

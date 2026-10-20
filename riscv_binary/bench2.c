@@ -8,7 +8,7 @@ int main(void) {
     for (long i = 0; i < N; i += 4096) a[i] = 1;   /* 미리 매핑 */
 
     long sum = 0;
-    for (long i = 0; i < 500000; i++)
+    for (long i = 0; i < 16384; i++)
         sum += a[(i * 4099) % N];                  /* 무작위 페이지 접근 */
 
     printf("%ld\n", sum);

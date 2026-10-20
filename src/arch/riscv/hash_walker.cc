@@ -197,7 +197,7 @@ HashWalker::WalkerState::startWalk()
         timingFault = NoFault;
         if (walker->hashLatency > Cycles(0)) {
             // Defer the first packet by hashLatency cycles to model the
-            // cost of computing the bucket address (hash + fingerprint).
+            // cost of computing the bucket address (hash of the VPN).
             // Atomic mode skips this because event scheduling does not
             // work there; Atomic walks are used for warmup only.
             walker->schedule(walker->sendFirstPacketEvent,
@@ -221,7 +221,7 @@ HashWalker::WalkerState::startWalk()
 }
 
 // ── setupWalk ─────────────────────────────────────────────────
-// First read: routingTable[fp] of the main bucket (1 byte).
+// First read: the whole main bucket line (64 B).
 void
 HashWalker::WalkerState::setupWalk(Addr vaddr)
 {
@@ -229,10 +229,7 @@ HashWalker::WalkerState::setupWalk(Addr vaddr)
     vaddr  = Addr(sext<VADDR_BITS>(vaddr));
     vpn    = vaddr & ~(hashPT->pageSize() - 1);
     bucket = hashPT->mainHash(vpn);
-    fp     = hashPT->fingerprint(vpn);
-    slot   = HASH_SLOT_NONE;
     ovPass = 0;
-    ovSlot = 0;
 
     entry.vaddr = vaddr;
     entry.asid  = satp.asid;
@@ -240,13 +237,12 @@ HashWalker::WalkerState::setupWalk(Addr vaddr)
     walker->stats.walks++;
 
     DPRINTF(HashPageTableWalker,
-            "Hash walk vaddr %#x vpn %#x bucket %d fp %#x\n",
-            vaddr, vpn, bucket, fp);
+            "Hash walk vaddr %#x vpn %#x bucket %d\n", vaddr, vpn, bucket);
 
-    state     = Routing;
+    state     = Bucket;
     nextState = Ready;
-    read = makeReadPkt(hashPT->routingAddr(bucket, fp), sizeof(uint8_t),
-                       Routing);
+    read = makeReadPkt(hashPT->mainLineAddr(bucket), sizeof(HashLine),
+                       Bucket);
 }
 
 // ── nextRead ──────────────────────────────────────────────────
@@ -266,33 +262,48 @@ HashWalker::WalkerState::nextRead(Addr physAddr, size_t size,
 bool
 HashWalker::WalkerState::matchPTE(const HashPTE &pte, Fault &fault)
 {
-    if (!pte.valid || pte.vaddr != vpn)
+    if (!pte.matches(vpn))
         return false;
 
     // Synthesise an Sv39-format PTE so TLB::checkPermissions() works both
     // here and on later TLB hits in TLB::doTranslate().
     PTESv39 sv = 0;
     sv.v   = 1;
-    sv.r   = (pte.flags & HashArchPageTable::FLAG_READ)    ? 1 : 0;
-    sv.w   = (pte.flags & HashArchPageTable::FLAG_WRITE)   ? 1 : 0;
-    sv.x   = (pte.flags & HashArchPageTable::FLAG_EXECUTE) ? 1 : 0;
-    sv.u   = (pte.flags & HashArchPageTable::FLAG_USER)    ? 1 : 0;
+    const uint64_t fl = pte.flags();
+    sv.r   = (fl & HashArchPageTable::FLAG_READ)    ? 1 : 0;
+    sv.w   = (fl & HashArchPageTable::FLAG_WRITE)   ? 1 : 0;
+    sv.x   = (fl & HashArchPageTable::FLAG_EXECUTE) ? 1 : 0;
+    sv.u   = (fl & HashArchPageTable::FLAG_USER)    ? 1 : 0;
     sv.a   = 1;   // no A/D write-back in the hash walker
     sv.d   = 1;
-    sv.ppn = pte.paddr >> PageShift;
+    sv.ppn = pte.paddr() >> PageShift;
 
     entry.pte      = sv;
-    entry.paddr    = pte.paddr >> PageShift;
-    entry.logBytes = pte.logBytes;
+    entry.paddr    = pte.paddr() >> PageShift;
+    entry.logBytes = pte.logBytes();
 
     fault = walker->tlb->checkPermissions(status, pmode, entry.vaddr,
                                           mode, sv);
     return true;
 }
 
+// ── matchLine ─────────────────────────────────────────────────
+// Compare the 8 tags of a line. Returns true if the walk is finished.
+bool
+HashWalker::WalkerState::matchLine(const HashLine &line, Fault &fault,
+                                   bool &hit)
+{
+    int s = line.find(vpn);
+    if (s < 0)
+        return false;
+    bool done = matchPTE(line.e[s], fault);
+    hit = done && fault == NoFault;
+    return done;
+}
+
 // ── stepWalk ──────────────────────────────────────────────────
-// Parses the single field in `read` and either finishes the walk or
-// queues exactly one more single-field read.
+// Parses the line in `read` and either finishes the walk or queues
+// exactly one more line read.
 Fault
 HashWalker::WalkerState::stepWalk(PacketPtr &write)
 {
@@ -304,64 +315,34 @@ HashWalker::WalkerState::stepWalk(PacketPtr &write)
     bool  hit      = false;      // translation found and permitted
 
     switch (state) {
-      case Routing: {
-        slot = read->getLE<uint8_t>();
-        if (slot != HASH_SLOT_NONE)
-            nextRead(hashPT->entryAddr(bucket, slot), sizeof(HashPTE), Entry);
-        else
-            nextRead(hashPT->floatingAddr(bucket), sizeof(uint32_t),
-                     Floating);
-        break;
-      }
-
-      case Entry: {
-        HashPTE pte;
-        read->writeData(reinterpret_cast<uint8_t *>(&pte));
-        if (matchPTE(pte, fault)) {
+      case Bucket: {
+        HashLine line;
+        read->writeData(reinterpret_cast<uint8_t *>(&line));
+        if (matchLine(line, fault, hit)) {
             finished = true;
-            hit      = (fault == NoFault);
-        } else if (pte.next != HASH_SLOT_NONE) {
-            slot = pte.next;
-            nextRead(hashPT->entryAddr(bucket, slot), sizeof(HashPTE), Entry);
+        } else if (line.spilled()) {
+            // The spill bit came with the same line: no extra read
+            walker->stats.overflowWalks++;
+            ovPass   = 0;
+            ovBucket = hashPT->ovHash1(vpn);
+            nextRead(hashPT->ovLineAddr(ovBucket), sizeof(HashLine), OvLine);
         } else {
-            nextRead(hashPT->floatingAddr(bucket), sizeof(uint32_t),
-                     Floating);
-        }
-        break;
-      }
-
-      case Floating: {
-        uint32_t floating = read->getLE<uint32_t>();
-        if (floating == 0) {
             DPRINTF(HashPageTableWalker, "vpn %#x not mapped\n", vpn);
             fault    = pageFault();
             finished = true;
-        } else {
-            walker->stats.overflowWalks++;
-            ovPass   = 0;
-            ovSlot   = 0;
-            ovBucket = hashPT->ovHash1(vpn);
-            nextRead(hashPT->ovSlotAddr(ovBucket, ovSlot),
-                     sizeof(HashPTE), OvSlot);
         }
         break;
       }
 
-      case OvSlot: {
-        HashPTE pte;
-        read->writeData(reinterpret_cast<uint8_t *>(&pte));
-        if (matchPTE(pte, fault)) {
+      case OvLine: {
+        HashLine line;
+        read->writeData(reinterpret_cast<uint8_t *>(&line));
+        if (matchLine(line, fault, hit)) {
             finished = true;
-            hit      = (fault == NoFault);
-        } else if (++ovSlot < OV_SLOTS_PER_BKT) {
-            nextRead(hashPT->ovSlotAddr(ovBucket, ovSlot),
-                     sizeof(HashPTE), OvSlot);
         } else if (ovPass == 0) {
             ovPass   = 1;
-            ovSlot   = 0;
             ovBucket = hashPT->ovHash2(vpn);
-            nextRead(hashPT->ovSlotAddr(ovBucket, ovSlot),
-                     sizeof(HashPTE), OvSlot);
+            nextRead(hashPT->ovLineAddr(ovBucket), sizeof(HashLine), OvLine);
         } else {
             DPRINTF(HashPageTableWalker,
                     "vpn %#x not found in overflow\n", vpn);
@@ -411,17 +392,13 @@ HashWalker::WalkerState::makeReadPkt(Addr physAddr, size_t size,
     walkReads++;
     walker->stats.reads++;
     switch (kind) {
-      case Routing:  walker->stats.routingReads++;  break;
-      case Entry:    walker->stats.entryReads++;    break;
-      case Floating: walker->stats.floatingReads++; break;
-      case OvSlot:   walker->stats.ovSlotReads++;   break;
+      case Bucket: walker->stats.bucketReads++; break;
+      case OvLine: walker->stats.ovLineReads++; break;
       default: panic("HashWalker: bad read kind %d", kind);
     }
 
-    // A single field never crosses a cache line (checked at compile time
-    // in hash_arch_page_table.hh); assert it here as well.
-    assert(physAddr / HASH_CACHE_LINE ==
-           (physAddr + size - 1) / HASH_CACHE_LINE);
+    // Every read is exactly one aligned cache line
+    assert(size == HASH_CACHE_LINE && physAddr % HASH_CACHE_LINE == 0);
 
     RequestPtr request = std::make_shared<Request>(
         physAddr, size, Request::PHYSICAL, walker->requestorId);
@@ -548,15 +525,11 @@ HashWalker::HashWalkerStats::HashWalkerStats(statistics::Group *parent)
     ADD_STAT(walks, statistics::units::Count::get(),
              "Number of hash page table walks started"),
     ADD_STAT(reads, statistics::units::Count::get(),
-             "Memory reads issued by the walker (one field per read)"),
-    ADD_STAT(routingReads, statistics::units::Count::get(),
-             "Reads of routingTable[fp]"),
-    ADD_STAT(entryReads, statistics::units::Count::get(),
-             "Reads of main-bucket PTEs (one per chain step)"),
-    ADD_STAT(floatingReads, statistics::units::Count::get(),
-             "Reads of floatingCount (main-chain misses)"),
-    ADD_STAT(ovSlotReads, statistics::units::Count::get(),
-             "Reads of overflow slots"),
+             "Memory reads issued by the walker (one 64 B line per read)"),
+    ADD_STAT(bucketReads, statistics::units::Count::get(),
+             "Reads of main bucket lines (one per walk)"),
+    ADD_STAT(ovLineReads, statistics::units::Count::get(),
+             "Reads of overflow bucket lines"),
     ADD_STAT(overflowWalks, statistics::units::Count::get(),
              "Walks that searched the overflow table"),
     ADD_STAT(hits, statistics::units::Count::get(),
@@ -570,7 +543,7 @@ HashWalker::HashWalkerStats::HashWalkerStats(statistics::Group *parent)
     ADD_STAT(readsPerWalk, statistics::units::Count::get(),
              "Distribution of memory reads per completed walk")
 {
-    readsPerWalk.init(1, 16, 1);
+    readsPerWalk.init(1, 4, 1);
 }
 
 } // namespace RiscvISA

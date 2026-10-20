@@ -5,28 +5,48 @@
  * structure placed in simulated physical memory, so that HashWalker can
  * translate addresses with real (cacheable) memory accesses.
  *
- * Physical memory layout (all offsets multiples of the 64 B cache line):
+ * v5 layout: 8 B entries, one bucket = one 64 B cache line
  *
  *   baseAddr_
- *   +-- HashBucket[numBuckets]                1344 B each (21 lines)
- *   |     routingTable[256]  (1 B per fp)     line 0-3
- *   |     floatingCount      (4 B)            line 4
- *   |     padding                             line 4
- *   |     entries[32]        (32 B each)      line 5-20
- *   +-- OvBucket[numOvBuckets]                128 B each (2 lines)
- *         slots[4]           (32 B each)
+ *   +-- HashLine[numBuckets]       main buckets, 64 B each (8 entries)
+ *   +-- HashLine[numOvBuckets]     overflow buckets, 64 B each (8 entries)
  *
- * Every read the walker issues stays inside a single cache line:
- *   routingTable[fp] (1 B) -> entries[cur] (32 B, carries next link)
- *   -> floatingCount (4 B, main-chain miss only) -> overflow slot (32 B)
+ * Walker reads (every read is one whole cache line, 64 B):
+ *   1. main bucket line        -> compare the 8 VPN tags inside the line
+ *   2. overflow line ovHash1   -> only if the bucket's spill bit is set
+ *   3. overflow line ovHash2
+ *
+ * Compared with v4 (32 B entries, 1344 B buckets):
+ *   - no routingTable / fingerprint: the whole bucket arrives in one read
+ *   - no floatingCount read: the walker sees a 1-bit "spilled" flag kept in
+ *     slot 0 of the bucket line; the count itself lives in host memory
+ *   - no fp chain, so no next field and no vacancy stack
+ *
+ * HashPTE (8 B):
+ *   bits  0..26  VPN tag  = vaddr bits 12..38 (Sv39 VA, bit 38 is the sign)
+ *   bits 27..52  PPN      (26 bit: physical address < 256 GiB)
+ *   bits 53..56  R W X U  (the only permission bits the walker uses)
+ *   bits 57..58  page size (0 = 4 KiB, 1 = 2 MiB, 2 = 1 GiB)
+ *   bit  59      valid
+ *   bit  60      spilled  (slot 0 of a main bucket only)
+ *   bits 61..63  unused
+ *   No ASID: every process has its own table (gem5 SE mode).
  *
  * numBuckets / numOvBuckets come from Process.hashPTBuckets /
- * Process.hashPTOvBuckets. Only the per-bucket struct sizes are fixed at
- * compile time; the bucket counts only enter the address arithmetic.
+ * Process.hashPTOvBuckets. Slot count for 1 GiB is 262,144
+ * ((main + overflow) x 8), but the usable load depends on the split:
+ * a page that finds its main bucket and both overflow candidates full
+ * stops the simulation (fatal). Measured first fatal (SE-like layout):
+ *   main + overflow     first fatal          load
+ *   32256 + 512         ~156K pages (611 MiB) 60%
+ *   30720 + 2048        ~195K pages (762 MiB) 75%
+ *   28672 + 4096        ~217K pages (845 MiB) 83%
+ *   24576 + 8192        ~235K pages (917 MiB) 90%
+ * More overflow = more pages fit, but those pages cost 2-3 reads per walk.
  *
  * Host memory only (never read by the walker):
- *   tabulation hash tables, fingerprint constant, vacancy map,
- *   overflow bucket occupancy counts, statistics.
+ *   tabulation hash tables, per-bucket overflow counts (floatingCount),
+ *   overflow bucket occupancy, statistics.
  */
 
 #ifndef __ARCH_RISCV_HASH_ARCH_PAGE_TABLE_HH__
@@ -51,77 +71,131 @@ namespace gem5
 // ============================================================
 // Layout constants
 // ============================================================
-static constexpr size_t  HASH_CACHE_LINE    = 64;
-static constexpr uint8_t HASH_SLOT_NONE     = 0xFF;
-
-static constexpr size_t  HASH_DEFAULT_BUCKETS    = 1024;
-static constexpr size_t  HASH_SLOTS         = 32;
-static constexpr size_t  HASH_FP_BITS       = 8;
-static constexpr size_t  HASH_NUM_FP_VALUES = 1 << HASH_FP_BITS;   // 256
-
-static constexpr size_t  HASH_DEFAULT_OV_BUCKETS = 1024;
-static constexpr size_t  OV_SLOTS_PER_BKT   = 4;
-
-static_assert(HASH_SLOTS < HASH_SLOT_NONE,
-              "slot index must fit in uint8_t with 0xFF reserved");
+static constexpr size_t HASH_CACHE_LINE         = 64;
+static constexpr size_t HASH_DEFAULT_BUCKETS    = 4096;  // x 8 = 32,768 slots
+static constexpr size_t HASH_DEFAULT_OV_BUCKETS = 512;   // x 8 =  4,096 slots
 
 // ============================================================
 // Structures placed in simulated physical memory
 // ============================================================
 
-// PTE: 32 B, two per cache line. The fp-chain link lives in the PTE
-// so one read per chain step is enough.
+// PTE: 8 B, eight per cache line
 struct HashPTE
 {
-    Addr     vaddr;       // page-aligned virtual address (collision key)
-    Addr     paddr;       // page-aligned physical address
-    uint64_t flags;       // HashArchPageTable::HashFlags
-    uint8_t  valid;
-    uint8_t  logBytes;    // 12 = 4 KiB
-    uint8_t  next;        // next slot in fp chain (HASH_SLOT_NONE = end)
-    uint8_t  _pad[5];
+    uint64_t raw;
 
-    HashPTE()
-        : vaddr(0), paddr(0), flags(0), valid(0), logBytes(12),
-          next(HASH_SLOT_NONE), _pad{} {}
+    static constexpr unsigned VPN_BITS = 27, PPN_BITS = 26;
+    static constexpr unsigned VPN_SH = 0, PPN_SH = 27, FL_SH = 53,
+                              SZ_SH = 57, V_SH = 59, SP_SH = 60;
+    static constexpr uint64_t M(unsigned b) { return (1ULL << b) - 1; }
 
-    HashPTE(Addr _va, Addr _pa, uint64_t _fl, uint8_t _lb = 12)
-        : vaddr(_va), paddr(_pa), flags(_fl), valid(1), logBytes(_lb),
-          next(HASH_SLOT_NONE), _pad{} {}
-};
-static_assert(sizeof(HashPTE) == 32, "HashPTE must be 32 bytes");
-static_assert(HASH_CACHE_LINE % sizeof(HashPTE) == 0,
-              "HashPTE must not straddle a cache line");
+    static constexpr unsigned VA_BITS = VPN_BITS + 12;           // 39 (Sv39)
+    static constexpr Addr     MAX_PADDR = 1ULL << (PPN_BITS + 12);
 
-// Header (routingTable + floatingCount) padded to whole cache lines
-static constexpr size_t HASH_HDR_RAW  = HASH_NUM_FP_VALUES + sizeof(uint32_t);
-static constexpr size_t HASH_HDR_SIZE =
-    (HASH_HDR_RAW + HASH_CACHE_LINE - 1) / HASH_CACHE_LINE * HASH_CACHE_LINE;
+    // VPN tag of a page-aligned, canonical Sv39 virtual address
+    static uint64_t tagOf(Addr vpn) { return (vpn >> 12) & M(VPN_BITS); }
 
-struct HashBucket
-{
-    uint8_t  routingTable[HASH_NUM_FP_VALUES]; // fp -> first slot
-    uint32_t floatingCount;                    // entries sent to overflow
-    uint8_t  _pad[HASH_HDR_SIZE - HASH_HDR_RAW];
-    HashPTE  entries[HASH_SLOTS];
+    // True if bits 63..39 are copies of bit 38 (canonical Sv39 address)
+    static bool
+    canonical(Addr va)
+    {
+        uint64_t top = va >> (VA_BITS - 1);           // bits 63..38
+        return top == 0 || top == M(64 - VA_BITS + 1);
+    }
 
-    HashBucket() : floatingCount(0), _pad{} {
-        for (size_t i = 0; i < HASH_NUM_FP_VALUES; i++)
-            routingTable[i] = HASH_SLOT_NONE;
+    static unsigned lbToSel(unsigned lb) { return lb == 12 ? 0 : lb == 21 ? 1 : 2; }
+    static unsigned selToLb(unsigned s)  { return s == 0 ? 12 : s == 1 ? 21 : 30; }
+
+    HashPTE() : raw(0) {}
+
+    // hflags uses HashArchPageTable::HashFlags (bit 0 valid, 1..4 R W X U)
+    HashPTE(Addr vpn, Addr pa, uint64_t hflags, unsigned logBytes = 12)
+        : raw(0)
+    {
+        raw = tagOf(vpn)                      << VPN_SH
+            | ((pa >> 12) & M(PPN_BITS))      << PPN_SH
+            | ((hflags >> 1) & M(4))          << FL_SH
+            | uint64_t(lbToSel(logBytes))     << SZ_SH
+            | 1ULL                            << V_SH;
+    }
+
+    uint64_t tag()      const { return (raw >> VPN_SH) & M(VPN_BITS); }
+    Addr     paddr()    const { return ((raw >> PPN_SH) & M(PPN_BITS)) << 12; }
+    uint64_t flags()    const { return (((raw >> FL_SH) & M(4)) << 1) | 1; }
+    unsigned logBytes() const { return selToLb((raw >> SZ_SH) & 3); }
+    bool     valid()    const { return (raw >> V_SH) & 1; }
+    bool     spilled()  const { return (raw >> SP_SH) & 1; }
+
+    // Canonical (sign-extended) page-aligned virtual address
+    Addr
+    vaddr() const
+    {
+        Addr va = tag() << 12;
+        if (va & (1ULL << (VA_BITS - 1)))
+            va |= ~M(VA_BITS);
+        return va;
+    }
+
+    bool matches(Addr vpn) const { return valid() && tag() == tagOf(vpn); }
+
+    void
+    setSpilled(bool on)
+    {
+        raw = (raw & ~(1ULL << SP_SH)) | (uint64_t(on) << SP_SH);
+    }
+
+    // Update paddr / flags, keeping tag, size and spill bit
+    void
+    set(Addr pa, uint64_t hflags)
+    {
+        raw &= ~((M(PPN_BITS) << PPN_SH) | (M(4) << FL_SH));
+        raw |= ((pa >> 12) & M(PPN_BITS)) << PPN_SH
+             | ((hflags >> 1) & M(4))     << FL_SH;
+    }
+
+    // Replace the entry but keep this slot's spill bit
+    void
+    assign(const HashPTE &e)
+    {
+        bool sp = spilled();
+        raw = e.raw;
+        setSpilled(sp);
     }
 };
-static_assert(offsetof(HashBucket, entries) % HASH_CACHE_LINE == 0,
-              "entries must start on a cache line");
-static_assert(sizeof(HashBucket) % HASH_CACHE_LINE == 0,
-              "HashBucket must be a whole number of cache lines");
+static_assert(sizeof(HashPTE) == 8, "HashPTE must be 8 bytes");
 
-// Overflow bucket: slots only (occupancy count kept in host memory)
-struct OvBucket
+static constexpr size_t HASH_SLOTS = HASH_CACHE_LINE / sizeof(HashPTE);  // 8
+
+// One bucket = one cache line (main and overflow alike)
+struct HashLine
 {
-    HashPTE slots[OV_SLOTS_PER_BKT];
+    HashPTE e[HASH_SLOTS];
+
+    // Slot holding vpn, or -1
+    int
+    find(Addr vpn) const
+    {
+        for (size_t s = 0; s < HASH_SLOTS; s++)
+            if (e[s].matches(vpn))
+                return int(s);
+        return -1;
+    }
+
+    // First free slot, or -1
+    int
+    freeSlot() const
+    {
+        for (size_t s = 0; s < HASH_SLOTS; s++)
+            if (!e[s].valid())
+                return int(s);
+        return -1;
+    }
+
+    // The spill flag lives in slot 0 and is independent of its valid bit
+    bool spilled() const { return e[0].spilled(); }
 };
-static_assert(sizeof(OvBucket) % HASH_CACHE_LINE == 0,
-              "OvBucket must be a whole number of cache lines");
+static_assert(sizeof(HashLine) == HASH_CACHE_LINE,
+              "a bucket must be exactly one cache line");
 
 // ============================================================
 // HashArchPageTable
@@ -142,27 +216,16 @@ class HashArchPageTable : public EmulationPageTable
     System *system_;
     Addr    baseAddr_;
     bool    initialized_;
-    const size_t numBuckets_;     // main buckets
-    const size_t numOvBuckets_;   // overflow buckets (even)
+    const size_t numBuckets_;     // main buckets (one line each)
+    const size_t numOvBuckets_;   // overflow buckets (one line each, even)
     const size_t ovHalf_;         // two-choice split point
 
     // ── Host-memory-only state ────────────────────────────────
     uint64_t tab_[8][256];                 // main bucket hash
     uint64_t ovTab1_[8][256];              // overflow hash 1
     uint64_t ovTab2_[8][256];              // overflow hash 2
-    uint64_t fpMul_;                       // fingerprint multiplier
+    std::vector<uint32_t> floatingCount_;  // per main bucket: entries in overflow
     std::vector<uint32_t> ovCounts_;       // overflow occupancy (map-time)
-
-    struct SlotStack
-    {
-        uint8_t data[HASH_SLOTS];
-        uint8_t top;
-        SlotStack() : top(0) {}
-        void    push(uint8_t i) { data[top++] = i; }
-        uint8_t pop()           { return data[--top]; }
-        bool    empty() const   { return top == 0; }
-    };
-    std::vector<SlotStack> vacMap_;        // free slots per main bucket
 
     size_t numEntries_;
     size_t numOverflow_;
@@ -178,7 +241,7 @@ class HashArchPageTable : public EmulationPageTable
     void
     initHashes()
     {
-        // Fixed seeds for reproducible layouts across runs
+        // Fixed seeds for reproducible layouts across runs (same as v4)
         uint64_t s = 0x123456789abcdef0ULL;
         for (int i = 0; i < 8; i++)
             for (int j = 0; j < 256; j++)
@@ -190,8 +253,6 @@ class HashArchPageTable : public EmulationPageTable
                 ovTab1_[i][j] = (s = xorshift(s));
                 ovTab2_[i][j] = (s = xorshift(s));
             }
-
-        fpMul_ = xorshift(s) | 1;   // odd multiplier
     }
 
     static uint64_t
@@ -218,71 +279,31 @@ class HashArchPageTable : public EmulationPageTable
             const_cast<HashArchPageTable *>(this)->allocateLayout();
     }
 
-    HashBucket
-    readMainBucket(size_t idx) const
+    HashLine
+    readLine(Addr a) const
     {
-        HashBucket bkt;
-        proxy().readBlob(mainBucketAddr(idx), &bkt, sizeof(bkt));
-        return bkt;
+        HashLine l;
+        proxy().readBlob(a, &l, sizeof(l));
+        return l;
     }
 
     void
-    writeMainBucket(size_t idx, const HashBucket &bkt)
+    writeLine(Addr a, const HashLine &l)
     {
-        proxy().writeBlob(mainBucketAddr(idx), &bkt, sizeof(bkt));
+        proxy().writeBlob(a, &l, sizeof(l));
     }
 
-    HashPTE
-    readOvSlot(size_t b, size_t s) const
-    {
-        HashPTE pte;
-        proxy().readBlob(ovSlotAddr(b, s), &pte, sizeof(pte));
-        return pte;
-    }
-
-    void
-    writeOvSlot(size_t b, size_t s, const HashPTE &pte)
-    {
-        proxy().writeBlob(ovSlotAddr(b, s), &pte, sizeof(pte));
-    }
-
-    // ── Chain helpers (links stored in entries) ───────────────
-    static void
-    chainInsert(HashBucket &bkt, uint64_t fp, uint8_t slot)
-    {
-        bkt.entries[slot].next = bkt.routingTable[fp];
-        bkt.routingTable[fp]   = slot;
-    }
-
-    static void
-    chainRemove(HashBucket &bkt, uint64_t fp, uint8_t slot)
-    {
-        uint8_t cur = bkt.routingTable[fp];
-        if (cur == slot) {
-            bkt.routingTable[fp] = bkt.entries[slot].next;
-        } else {
-            while (cur != HASH_SLOT_NONE && bkt.entries[cur].next != slot)
-                cur = bkt.entries[cur].next;
-            if (cur != HASH_SLOT_NONE)
-                bkt.entries[cur].next = bkt.entries[slot].next;
-        }
-        bkt.entries[slot].next = HASH_SLOT_NONE;
-    }
-
-    // ── Overflow (two-choice hashing) ─────────────────────────
+    // ── Overflow (two-choice hashing, one line per bucket) ────
     bool
     ovUpdate(size_t b, Addr vpn, Addr pa, uint64_t flags)
     {
-        for (size_t s = 0; s < OV_SLOTS_PER_BKT; s++) {
-            HashPTE pte = readOvSlot(b, s);
-            if (pte.valid && pte.vaddr == vpn) {
-                pte.paddr = pa;
-                pte.flags = flags;
-                writeOvSlot(b, s, pte);
-                return true;
-            }
-        }
-        return false;
+        HashLine l = readLine(ovLineAddr(b));
+        int s = l.find(vpn);
+        if (s < 0)
+            return false;
+        l.e[s].set(pa, flags);
+        writeLine(ovLineAddr(b), l);
+        return true;
     }
 
     bool
@@ -293,27 +314,27 @@ class HashArchPageTable : public EmulationPageTable
             return true;
 
         size_t b = (ovCounts_[b1] <= ovCounts_[b2]) ? b1 : b2;
-        for (size_t s = 0; s < OV_SLOTS_PER_BKT; s++) {
-            if (!readOvSlot(b, s).valid) {
-                writeOvSlot(b, s, HashPTE(vpn, pa, flags));
-                ovCounts_[b]++;
-                return true;
-            }
-        }
-        return false;
+        HashLine l = readLine(ovLineAddr(b));
+        int s = l.freeSlot();
+        if (s < 0)
+            return false;
+        l.e[s] = HashPTE(vpn, pa, flags);
+        writeLine(ovLineAddr(b), l);
+        ovCounts_[b]++;
+        return true;
     }
 
     bool
     ovUnmap(Addr vpn)
     {
         for (size_t b : {ovHash1(vpn), ovHash2(vpn)}) {
-            for (size_t s = 0; s < OV_SLOTS_PER_BKT; s++) {
-                HashPTE pte = readOvSlot(b, s);
-                if (pte.valid && pte.vaddr == vpn) {
-                    writeOvSlot(b, s, HashPTE());
-                    ovCounts_[b]--;
-                    return true;
-                }
+            HashLine l = readLine(ovLineAddr(b));
+            int s = l.find(vpn);
+            if (s >= 0) {
+                l.e[s] = HashPTE();
+                writeLine(ovLineAddr(b), l);
+                ovCounts_[b]--;
+                return true;
             }
         }
         return false;
@@ -326,37 +347,37 @@ class HashArchPageTable : public EmulationPageTable
     physMap(Addr vpn, Addr pa, uint64_t hflags)
     {
         ensureInit();
-        size_t   idx = mainHash(vpn);
-        uint64_t fp  = fingerprint(vpn);
-        HashBucket bkt = readMainBucket(idx);
+        fatal_if(!HashPTE::canonical(vpn),
+                 "HashArchPageTable: vaddr %#x is not a canonical Sv39 "
+                 "address (the 8 B entry keeps a 27-bit VPN)", vpn);
+        fatal_if(pa >= HashPTE::MAX_PADDR,
+                 "HashArchPageTable: paddr %#x does not fit the 26-bit PPN",
+                 pa);
 
-        // Update in place if already present in main bucket
-        for (uint8_t cur = bkt.routingTable[fp]; cur != HASH_SLOT_NONE;
-             cur = bkt.entries[cur].next) {
-            HashPTE &e = bkt.entries[cur];
-            if (e.valid && e.vaddr == vpn) {
-                e.paddr = pa;
-                e.flags = hflags;
-                writeMainBucket(idx, bkt);
-                return;
-            }
+        size_t   idx = mainHash(vpn);
+        HashLine bkt = readLine(mainLineAddr(idx));
+
+        // Update in place if already present in the main bucket
+        int s = bkt.find(vpn);
+        if (s >= 0) {
+            bkt.e[s].set(pa, hflags);
+            writeLine(mainLineAddr(idx), bkt);
+            return;
         }
 
         // A VPN may already live in overflow (spilled while the bucket was
         // full). Update it there instead of inserting a second copy into a
         // slot freed since then; otherwise a later unmap would remove only
         // the main copy and the walker would find the stale overflow one.
-        if (bkt.floatingCount > 0 &&
+        if (floatingCount_[idx] > 0 &&
             (ovUpdate(ovHash1(vpn), vpn, pa, hflags) ||
              ovUpdate(ovHash2(vpn), vpn, pa, hflags)))
             return;
 
-        if (!vacMap_[idx].empty()) {
-            uint8_t slot = vacMap_[idx].pop();
-            bkt.entries[slot] = HashPTE(vpn, pa, hflags,
-                                        RiscvISA::PageShift);
-            chainInsert(bkt, fp, slot);
-            writeMainBucket(idx, bkt);
+        s = bkt.freeSlot();
+        if (s >= 0) {
+            bkt.e[s].assign(HashPTE(vpn, pa, hflags, RiscvISA::PageShift));
+            writeLine(mainLineAddr(idx), bkt);
             numEntries_++;
             return;
         }
@@ -368,8 +389,9 @@ class HashArchPageTable : public EmulationPageTable
                  "HashArchPageTable: bucket %d and both overflow buckets "
                  "are full (vpn %#x). Increase Process.hashPTBuckets / "
                  "hashPTOvBuckets.", idx, vpn);
-        bkt.floatingCount++;
-        writeMainBucket(idx, bkt);
+        floatingCount_[idx]++;
+        bkt.e[0].setSpilled(true);
+        writeLine(mainLineAddr(idx), bkt);
         numOverflow_++;
     }
 
@@ -378,25 +400,20 @@ class HashArchPageTable : public EmulationPageTable
     {
         ensureInit();
         size_t   idx = mainHash(vpn);
-        uint64_t fp  = fingerprint(vpn);
-        HashBucket bkt = readMainBucket(idx);
+        HashLine bkt = readLine(mainLineAddr(idx));
 
-        for (uint8_t cur = bkt.routingTable[fp]; cur != HASH_SLOT_NONE;
-             cur = bkt.entries[cur].next) {
-            if (bkt.entries[cur].valid && bkt.entries[cur].vaddr == vpn) {
-                chainRemove(bkt, fp, cur);
-                bkt.entries[cur] = HashPTE();
-                vacMap_[idx].push(cur);
-                writeMainBucket(idx, bkt);
-                numEntries_--;
-                return;
-            }
+        int s = bkt.find(vpn);
+        if (s >= 0) {
+            bkt.e[s].assign(HashPTE());          // keeps slot 0's spill bit
+            writeLine(mainLineAddr(idx), bkt);
+            numEntries_--;
+            return;
         }
 
-        if (ovUnmap(vpn)) {
-            if (bkt.floatingCount > 0)
-                bkt.floatingCount--;
-            writeMainBucket(idx, bkt);
+        if (floatingCount_[idx] > 0 && ovUnmap(vpn)) {
+            floatingCount_[idx]--;
+            bkt.e[0].setSpilled(floatingCount_[idx] > 0);
+            writeLine(mainLineAddr(idx), bkt);
             numOverflow_--;
         }
     }
@@ -410,8 +427,8 @@ class HashArchPageTable : public EmulationPageTable
           system_(sys), baseAddr_(0), initialized_(false),
           numBuckets_(numBuckets), numOvBuckets_(numOvBuckets),
           ovHalf_(numOvBuckets / 2),
-          fpMul_(0), ovCounts_(numOvBuckets, 0),
-          vacMap_(numBuckets), numEntries_(0), numOverflow_(0)
+          floatingCount_(numBuckets, 0), ovCounts_(numOvBuckets, 0),
+          numEntries_(0), numOverflow_(0)
     {
         fatal_if(numBuckets_ == 0, "HashArchPageTable: numBuckets must be > 0");
         fatal_if(numOvBuckets_ < 2 || numOvBuckets_ % 2,
@@ -419,12 +436,10 @@ class HashArchPageTable : public EmulationPageTable
                  "(two-choice hashing splits it in half), got %d",
                  numOvBuckets_);
         initHashes();
-        for (auto &st : vacMap_)
-            for (size_t i = HASH_SLOTS; i-- > 0;)
-                st.push(static_cast<uint8_t>(i));
     }
 
-    // Allocate and initialise the physical layout (idempotent).
+    // Allocate and zero the physical layout (idempotent). An all-zero
+    // line is an empty bucket: every entry invalid, spill bit clear.
     void
     allocateLayout()
     {
@@ -437,10 +452,6 @@ class HashArchPageTable : public EmulationPageTable
         size_t npages = (physLayoutSize() + _pageSize - 1) / _pageSize;
         baseAddr_ = se->allocPhysPages(npages);
         proxy().memsetBlob(baseAddr_, 0, npages * _pageSize);
-
-        // routingTable must start as HASH_SLOT_NONE, not zero
-        for (size_t i = 0; i < numBuckets_; i++)
-            writeMainBucket(i, HashBucket());
 
         initialized_ = true;
     }
@@ -458,47 +469,21 @@ class HashArchPageTable : public EmulationPageTable
     Addr getBaseAddr() const { return baseAddr_; }
 
     Addr
-    mainBucketAddr(size_t idx) const
+    mainLineAddr(size_t idx) const
     {
-        return baseAddr_ + idx * sizeof(HashBucket);
+        return baseAddr_ + idx * sizeof(HashLine);
     }
 
     Addr
-    routingAddr(size_t idx, uint64_t fp) const
+    ovLineAddr(size_t b) const
     {
-        return mainBucketAddr(idx) + offsetof(HashBucket, routingTable) + fp;
-    }
-
-    Addr
-    floatingAddr(size_t idx) const
-    {
-        return mainBucketAddr(idx) + offsetof(HashBucket, floatingCount);
-    }
-
-    Addr
-    entryAddr(size_t idx, uint8_t slot) const
-    {
-        return mainBucketAddr(idx) + offsetof(HashBucket, entries) +
-               slot * sizeof(HashPTE);
-    }
-
-    Addr
-    ovSlotAddr(size_t b, size_t slot) const
-    {
-        return baseAddr_ + numBuckets_ * sizeof(HashBucket) +
-               b * sizeof(OvBucket) + slot * sizeof(HashPTE);
+        return baseAddr_ + (numBuckets_ + b) * sizeof(HashLine);
     }
 
     size_t
     mainHash(Addr vpn) const
     {
         return tabulationHash(tab_, vpnKey(vpn)) % numBuckets_;
-    }
-
-    uint64_t
-    fingerprint(Addr vpn) const
-    {
-        return (fpMul_ * vpnKey(vpn)) >> (64 - HASH_FP_BITS);
     }
 
     size_t
@@ -551,7 +536,7 @@ class HashArchPageTable : public EmulationPageTable
             HashPTE pte;
             if (physLookup(oldVpn, pte)) {
                 physUnmap(oldVpn);
-                physMap(newVpn, pte.paddr, pte.flags);
+                physMap(newVpn, pte.paddr(), pte.flags());
             }
         }
     }
@@ -561,30 +546,28 @@ class HashArchPageTable : public EmulationPageTable
     bool
     physLookup(Addr vpn, HashPTE &out) const
     {
+        // The tag keeps only bits 12..38, so a non-canonical address could
+        // alias a mapped page in the same bucket. Never mapped: not found.
+        if (!HashPTE::canonical(vpn))
+            return false;
         ensureInit();
-        size_t   idx = mainHash(vpn);
-        uint64_t fp  = fingerprint(vpn);
-        HashBucket bkt = readMainBucket(idx);
+        HashLine bkt = readLine(mainLineAddr(mainHash(vpn)));
+        int s = bkt.find(vpn);
+        if (s >= 0) {
+            out = bkt.e[s];
+            return true;
+        }
+        if (!bkt.spilled())
+            return false;
 
-        for (uint8_t cur = bkt.routingTable[fp]; cur != HASH_SLOT_NONE;
-             cur = bkt.entries[cur].next) {
-            if (bkt.entries[cur].valid && bkt.entries[cur].vaddr == vpn) {
-                out = bkt.entries[cur];
+        for (size_t b : {ovHash1(vpn), ovHash2(vpn)}) {
+            HashLine l = readLine(ovLineAddr(b));
+            s = l.find(vpn);
+            if (s >= 0) {
+                out = l.e[s];
                 return true;
             }
         }
-
-        if (bkt.floatingCount == 0)
-            return false;
-
-        for (size_t b : {ovHash1(vpn), ovHash2(vpn)})
-            for (size_t s = 0; s < OV_SLOTS_PER_BKT; s++) {
-                HashPTE pte = readOvSlot(b, s);
-                if (pte.valid && pte.vaddr == vpn) {
-                    out = pte;
-                    return true;
-                }
-            }
         return false;
     }
 
@@ -597,8 +580,7 @@ class HashArchPageTable : public EmulationPageTable
     size_t
     physLayoutSize() const
     {
-        return numBuckets_ * sizeof(HashBucket) +
-               numOvBuckets_ * sizeof(OvBucket);
+        return (numBuckets_ + numOvBuckets_) * sizeof(HashLine);
     }
 };
 

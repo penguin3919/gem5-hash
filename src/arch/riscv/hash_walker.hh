@@ -7,12 +7,15 @@
  *   - setupWalk() builds the first Packet, stepWalk() parses a response
  *     and builds the next one
  *
- * Every Packet reads one field that lies inside a single cache line:
+ * v5: every Packet reads one whole 64 B cache line (one bucket):
  *
- *   Routing   routingTable[fp]  1 B   -> first slot of the fp chain
- *   Entry     entries[cur]     32 B   -> vaddr check, next link
- *   Floating  floatingCount     4 B   -> only after a main-chain miss
- *   OvSlot    overflow slot    32 B   -> up to 4 slots x 2 buckets
+ *   Bucket    main bucket line  64 B  -> compare 8 VPN tags; spill bit
+ *   OvLine    overflow line     64 B  -> only if the spill bit is set,
+ *                                        ovHash1 first, then ovHash2
+ *
+ * A walk therefore issues 1 read (main hit or unmapped page in a bucket
+ * that never spilled), 2 reads (found in the first overflow line) or
+ * 3 reads (second overflow line, or a page fault in a spilled bucket).
  *
  * Differences from the Sv39 Walker:
  *   - no SATP-based table root (base address comes from HashArchPageTable)
@@ -23,8 +26,8 @@
  *     HashArchPageTable::physLookup() directly
  *
  * Stats (per walker, i.e. separately for the I-TLB and D-TLB):
- *   walks, reads (+ per field kind), avgReadsPerWalk, readsPerWalk
- *   distribution, overflowWalks, hits, pageFaults
+ *   walks, reads (+ bucketReads / ovLineReads), avgReadsPerWalk,
+ *   readsPerWalk distribution, overflowWalks, hits, pageFaults
  */
 
 #ifndef __ARCH_RISCV_HASH_WALKER_HH__
@@ -83,10 +86,8 @@ class HashWalker : public ClockedObject
         {
             Ready,
             Waiting,
-            Routing,    // waiting for routingTable[fp]
-            Entry,      // waiting for entries[cur]
-            Floating,   // waiting for floatingCount
-            OvSlot,     // waiting for overflow slot
+            Bucket,     // waiting for the main bucket line (64 B)
+            OvLine,     // waiting for an overflow bucket line (64 B)
         };
 
       protected:
@@ -114,11 +115,8 @@ class HashWalker : public ClockedObject
         HashArchPageTable      *hashPT;
         Addr                    vpn;      // page-aligned vaddr
         size_t                  bucket;   // main bucket index
-        uint64_t                fp;       // fingerprint
-        uint8_t                 slot;     // current chain slot
         unsigned                ovPass;   // 0: overflow hash1, 1: hash2
         size_t                  ovBucket; // current overflow bucket
-        unsigned                ovSlot;   // current overflow slot
         unsigned                walkReads;// reads issued by this walk
 
       public:
@@ -131,9 +129,8 @@ class HashWalker : public ClockedObject
               translation(_translation),
               timing(false), retrying(false),
               started(false), squashed(false),
-              hashPT(nullptr), vpn(0), bucket(0), fp(0),
-              slot(HASH_SLOT_NONE), ovPass(0), ovBucket(0), ovSlot(0),
-              walkReads(0)
+              hashPT(nullptr), vpn(0), bucket(0),
+              ovPass(0), ovBucket(0), walkReads(0)
         {}
 
         void initState(ThreadContext *_tc, BaseMMU::Mode _mode,
@@ -155,10 +152,12 @@ class HashWalker : public ClockedObject
         void  endWalk();
         Fault pageFault();
 
-        // Queue the next single-field read and the state that parses it
+        // Queue the next line read and the state that parses it
         void  nextRead(Addr physAddr, size_t size, State parseState);
         // Try to finish the walk with a PTE read from memory
         bool  matchPTE(const HashPTE &pte, Fault &fault);
+        // Search a line read from memory; true if the walk is finished
+        bool  matchLine(const HashLine &line, Fault &fault, bool &hit);
 
         PacketPtr makeReadPkt(Addr physAddr, size_t size, State kind);
     };
@@ -193,10 +192,8 @@ class HashWalker : public ClockedObject
 
         statistics::Scalar walks;
         statistics::Scalar reads;
-        statistics::Scalar routingReads;
-        statistics::Scalar entryReads;
-        statistics::Scalar floatingReads;
-        statistics::Scalar ovSlotReads;
+        statistics::Scalar bucketReads;
+        statistics::Scalar ovLineReads;
         statistics::Scalar overflowWalks;
         statistics::Scalar hits;
         statistics::Scalar pageFaults;

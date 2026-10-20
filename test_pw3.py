@@ -15,8 +15,10 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--arch-pt", action="store_true")
 parser.add_argument("--hash-pt", action="store_true")
-parser.add_argument("--hash-pt-buckets", type=int, default=1024)
-parser.add_argument("--hash-pt-ov-buckets", type=int, default=1024)
+parser.add_argument("--hash-pt-buckets", type=int, default=4096,
+                    help="main buckets, 8 slots each. 1 GiB = (main+ov)*8 = 262144 slots; ")
+parser.add_argument("--hash-pt-ov-buckets", type=int, default=512,
+                    help="overflow buckets, 8 slots each, even")
 parser.add_argument("--hash-latency", type=int, default=0,
                     help="extra cycles for hash address computation (default 0)")
 parser.add_argument("--binary", required=True)

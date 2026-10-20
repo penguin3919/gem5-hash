@@ -497,7 +497,7 @@ TLB::translateFunctional(const RequestPtr &req, ThreadContext *tc,
             found = hpt->physLookup(vpn, pte);
         if (!found)
             return std::make_shared<GenericPageTableFault>(vaddr);
-        paddr = pte.paddr | hpt->pageOffset(vaddr);
+        paddr = pte.paddr() | hpt->pageOffset(vaddr);
     } else if (FullSystem || (proc && proc->useArchPT)) {
         MMU *mmu = static_cast<MMU *>(tc->getMMUPtr());
 

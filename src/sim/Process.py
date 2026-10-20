@@ -53,10 +53,14 @@ class Process(SimObject):
         "maintain a hash page table in simulated physical memory, walked by RiscvHashWalker",
     )
     hashPTBuckets = Param.Unsigned(
-        1024, "hash page table: main buckets (32 slots each)"
+        4096,
+        "hash page table: main buckets (one 64 B line, 8 slots each). "
+        "(main + overflow) x 8 slots; 1 GiB = 262,144 slots, but a full "
+        "bucket with full overflow candidates is fatal: 32256+512 fits "
+        "~60% (~611 MiB), 28672+4096 ~83%, 24576+8192 ~90%",
     )
     hashPTOvBuckets = Param.Unsigned(
-        1024, "hash page table: overflow buckets (4 slots each, even)"
+        512, "hash page table: overflow buckets (one 64 B line, 8 slots each, even)"
     )
     kvmInSE = Param.Bool("false", "initialize the process for KvmCPU in SE")
     maxStackSize = Param.MemorySize("64MiB", "maximum size of the stack")
