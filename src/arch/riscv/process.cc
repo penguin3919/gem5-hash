@@ -80,7 +80,8 @@ RiscvProcess::RiscvProcess(const ProcessParams &params,
                         new HashArchPageTable(params.name, params.pid,
                                              params.system, PageBytes,
                                              params.hashPTBuckets,
-                                             params.hashPTOvBuckets)) :
+                                             params.hashPTOvBuckets,
+                                             params.hashPTCluster)) :
                 params.useArchPT ?
                     static_cast<EmulationPageTable *>(
                         new ArchPageTable(params.name, params.pid,

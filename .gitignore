@@ -1,3 +1,4 @@
+riscv_binary/
 build
 parser.out
 parsetab.py

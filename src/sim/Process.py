@@ -62,6 +62,11 @@ class Process(SimObject):
     hashPTOvBuckets = Param.Unsigned(
         512, "hash page table: overflow buckets (one 64 B line, 8 slots each, even)"
     )
+    hashPTCluster = Param.Unsigned(
+        1,
+        "hash page table v6 soft clustering: K aligned pages share one main "
+        "bucket (1, 2, 4 or 8; 1 = v5). Backyard stays keyed by page.",
+    )
     kvmInSE = Param.Bool("false", "initialize the process for KvmCPU in SE")
     maxStackSize = Param.MemorySize("64MiB", "maximum size of the stack")
 

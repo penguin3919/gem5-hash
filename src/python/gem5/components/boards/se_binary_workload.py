@@ -75,6 +75,7 @@ class SEBinaryWorkload:
         use_hash_pt: bool = False,
         hash_pt_buckets: int = 4096,
         hash_pt_ov_buckets: int = 512,
+        hash_pt_cluster: int = 1,
     ) -> None:
         """Set up the system to run a specific binary.
 
@@ -103,6 +104,8 @@ class SEBinaryWorkload:
         28672+4096 ~83%, 24576+8192 ~90%.
         :param hash_pt_ov_buckets: Number of overflow buckets (one 64 B line,
         8 slots each, must be even). Only used with use_hash_pt.
+        :param hash_pt_cluster: v6 soft clustering K, pages that share one
+        main bucket (1, 2, 4 or 8; 1 = v5). Only used with use_hash_pt.
         """
 
         if use_arch_pt and use_hash_pt:
@@ -136,6 +139,7 @@ class SEBinaryWorkload:
         process.useHashPT = use_hash_pt
         process.hashPTBuckets = hash_pt_buckets
         process.hashPTOvBuckets = hash_pt_ov_buckets
+        process.hashPTCluster = hash_pt_cluster
 
         if isinstance(self.get_processor(), SwitchableProcessor):
             # This is a hack to get switchable processors working correctly in

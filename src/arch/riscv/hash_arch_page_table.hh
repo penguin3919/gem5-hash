@@ -5,7 +5,19 @@
  * structure placed in simulated physical memory, so that HashWalker can
  * translate addresses with real (cacheable) memory accesses.
  *
- * v5 layout: 8 B entries, one bucket = one 64 B cache line
+ * v6 layout: 8 B entries, one bucket = one 64 B cache line
+ *            + soft clustering (K = 1, 2, 4, 8 pages per hash key)
+ *
+ * v6 = v5 + soft clustering. The only difference is the main bucket key:
+ *   mainHash(vpn) = H( (vaddr >> 12) >> log2(K) ) % numBuckets
+ * K consecutive pages (an aligned K-page block) share one main bucket,
+ * but each page takes ANY free slot of that line (soft): there is no
+ * slot reserved per page, so lookup is unchanged (compare 8 VPN tags).
+ * Overflow (backyard) is keyed by the page VPN exactly as in v5
+ * (two-choice ovHash1/ovHash2 on the page key), so a block that does not
+ * fit in its main line spreads its pages over many overflow lines.
+ * No second chance: a page whose main line is full goes to the backyard.
+ * K = 1 is bit-for-bit v5. K comes from Process.hashPTCluster.
  *
  *   baseAddr_
  *   +-- HashLine[numBuckets]       main buckets, 64 B each (8 entries)
@@ -43,6 +55,8 @@
  *   28672 + 4096        ~217K pages (845 MiB) 83%
  *   24576 + 8192        ~235K pages (917 MiB) 90%
  * More overflow = more pages fit, but those pages cost 2-3 reads per walk.
+ * (table above is K = 1; K > 1 fills main lines unevenly on contiguous
+ *  layouts, so the first fatal comes earlier: use a larger backyard.)
  *
  * Host memory only (never read by the walker):
  *   tabulation hash tables, per-bucket overflow counts (floatingCount),
@@ -219,6 +233,8 @@ class HashArchPageTable : public EmulationPageTable
     const size_t numBuckets_;     // main buckets (one line each)
     const size_t numOvBuckets_;   // overflow buckets (one line each, even)
     const size_t ovHalf_;         // two-choice split point
+    const unsigned clusterPages_; // K: pages per main hash key (1,2,4,8)
+    const unsigned clusterShift_; // log2(K)
 
     // ── Host-memory-only state ────────────────────────────────
     uint64_t tab_[8][256];                 // main bucket hash
@@ -422,11 +438,15 @@ class HashArchPageTable : public EmulationPageTable
     HashArchPageTable(const std::string &name, uint64_t pid,
                       System *sys, Addr pageSize,
                       size_t numBuckets = HASH_DEFAULT_BUCKETS,
-                      size_t numOvBuckets = HASH_DEFAULT_OV_BUCKETS)
+                      size_t numOvBuckets = HASH_DEFAULT_OV_BUCKETS,
+                      unsigned clusterPages = 1)
         : EmulationPageTable(name, pid, pageSize),
           system_(sys), baseAddr_(0), initialized_(false),
           numBuckets_(numBuckets), numOvBuckets_(numOvBuckets),
           ovHalf_(numOvBuckets / 2),
+          clusterPages_(clusterPages),
+          clusterShift_(clusterPages == 8 ? 3 : clusterPages == 4 ? 2 :
+                        clusterPages == 2 ? 1 : 0),
           floatingCount_(numBuckets, 0), ovCounts_(numOvBuckets, 0),
           numEntries_(0), numOverflow_(0)
     {
@@ -435,6 +455,10 @@ class HashArchPageTable : public EmulationPageTable
                  "HashArchPageTable: numOvBuckets must be even and >= 2 "
                  "(two-choice hashing splits it in half), got %d",
                  numOvBuckets_);
+        fatal_if(clusterPages_ != 1 && clusterPages_ != 2 &&
+                 clusterPages_ != 4 && clusterPages_ != 8,
+                 "HashArchPageTable: hashPTCluster must be 1, 2, 4 or 8, "
+                 "got %d", clusterPages_);
         initHashes();
     }
 
@@ -483,7 +507,10 @@ class HashArchPageTable : public EmulationPageTable
     size_t
     mainHash(Addr vpn) const
     {
-        return tabulationHash(tab_, vpnKey(vpn)) % numBuckets_;
+        // v6 soft clustering: K aligned pages share one main bucket.
+        // (backyard hashes below stay on the page key, as in v5)
+        return tabulationHash(tab_, vpnKey(vpn) >> clusterShift_)
+               % numBuckets_;
     }
 
     size_t
@@ -576,6 +603,7 @@ class HashArchPageTable : public EmulationPageTable
 
     size_t numBuckets()   const { return numBuckets_; }
     size_t numOvBuckets() const { return numOvBuckets_; }
+    unsigned clusterPages() const { return clusterPages_; }
 
     size_t
     physLayoutSize() const

@@ -16,9 +16,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--arch-pt", action="store_true")
 parser.add_argument("--hash-pt", action="store_true")
 parser.add_argument("--hash-pt-buckets", type=int, default=4096,
-                    help="main buckets, 8 slots each. 1 GiB = (main+ov)*8 = 262144 slots; ")
+                    help="main buckets, 8 slots each. 1 GiB = (main+ov)*8 = 262144 slots; "
+                         "32256+512 fits ~60%%, 28672+4096 ~83%%, 24576+8192 ~90%% before a fatal")
 parser.add_argument("--hash-pt-ov-buckets", type=int, default=512,
                     help="overflow buckets, 8 slots each, even")
+parser.add_argument("--hash-pt-cluster", type=int, default=1,
+                    choices=[1, 2, 4, 8],
+                    help="v6 soft clustering: K pages share one main bucket "
+                         "(1 = v5; backyard stays keyed by page)")
 parser.add_argument("--hash-latency", type=int, default=0,
                     help="extra cycles for hash address computation (default 0)")
 parser.add_argument("--binary", required=True)
@@ -36,7 +41,7 @@ board = SimpleBoard(
     ),
     memory=SingleChannelDDR4_2400("1GB"),
     cache_hierarchy=PrivateL1PrivateL2CacheNoPTWCHierarchy(
-        l1d_size="64kB", l1i_size="64kB", l2_size="256kB"
+        l1d_size="64kB", l1i_size="64kB", l2_size="1MB"
     ),
 )
 
@@ -46,6 +51,7 @@ board.set_se_binary_workload(
     use_hash_pt=args.hash_pt,
     hash_pt_buckets=args.hash_pt_buckets,
     hash_pt_ov_buckets=args.hash_pt_ov_buckets,
+    hash_pt_cluster=args.hash_pt_cluster,
 )
 
 # Attach hash walkers when --hash-pt is set.

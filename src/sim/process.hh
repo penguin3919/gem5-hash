@@ -182,6 +182,7 @@ class Process : public SimObject
     // hash page table size (kept so clone()/fork() children get the same)
     unsigned hashPTBuckets;
     unsigned hashPTOvBuckets;
+    unsigned hashPTCluster;     // v6 soft clustering K (1 = v5)
     // running KVM requires special initialization
     bool kvmInSE;
     // flag for using the process as a thread which shares page tables

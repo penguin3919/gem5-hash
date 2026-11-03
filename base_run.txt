@@ -1,0 +1,2 @@
+  ./build/RISCV/gem5.opt -re --outdir=m5out_rand_base test_pw3.py --binary=riscv_binary/bench_rand
+  ./build/RISCV/gem5.opt -re --outdir=m5out_seq_base test_pw3.py --binary=riscv_binary/bench_seq

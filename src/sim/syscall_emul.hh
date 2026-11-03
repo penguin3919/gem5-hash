@@ -1656,6 +1656,7 @@ doClone(SyscallDesc *desc, ThreadContext *tc, RegVal flags, RegVal newStack,
     pp->pid = temp_pid;
     pp->ppid = (flags & OS::TGT_CLONE_THREAD) ? p->ppid() : p->pid();
     pp->useArchPT = p->useArchPT;
+    pp->hashPTCluster = p->hashPTCluster;
     pp->useHashPT = p->useHashPT;
     pp->hashPTBuckets = p->hashPTBuckets;
     pp->hashPTOvBuckets = p->hashPTOvBuckets;

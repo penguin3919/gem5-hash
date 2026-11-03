@@ -1,0 +1,5 @@
+size   result   lastMiB    message
+560    ok       544        
+600    ok       592        
+640    FATAL    608        bucket 19538 and both overflow buckets are full (vpn 0xfffffff026be8000
+700    FATAL    608        bucket 19538 and both overflow buckets are full (vpn 0xfffffff026be8000
